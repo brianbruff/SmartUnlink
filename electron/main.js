@@ -4,10 +4,100 @@ const fs = require('fs');
 const dgram = require('dgram');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
+const net = require('net');
+
+// Per-radio MultiFlex GUI client state tracker
+const radioStates = new Map();
+const radioSockets = new Map();
+
+function getDefaultRadioState() {
+  return {
+    status: 'Available',
+    inuse_ip: '',
+    inuse_host: '',
+    available_clients: '2',
+    gui_client_handles: '',
+    gui_client_stations: '',
+    gui_client_programs: '',
+    gui_client_hosts: '',
+    gui_client_ips: ''
+  };
+}
+
+function ensureFlexTracker(ip) {
+  if (!ip) return;
+  if (!radioStates.has(ip)) {
+    radioStates.set(ip, getDefaultRadioState());
+  }
+
+  const existing = radioSockets.get(ip);
+  if (existing && !existing.destroyed) return;
+
+  const client = new net.Socket();
+  radioSockets.set(ip, client);
+  let buf = '';
+
+  client.connect(4992, ip, () => {
+    client.write('C1|sub client all\n');
+  });
+
+  client.on('data', (chunk) => {
+    buf += chunk.toString('ascii');
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+
+      const mConn = line.match(/^S[0-9A-Fa-f]+\|client\s+0x([0-9A-Fa-f]+)\s+connected\s+(.*)/);
+      if (mConn) {
+        const handle = '0x' + mConn.at(1);
+        const kv = mConn.at(2);
+        const stM = kv.match(/station=([^\s]+)/);
+        const prM = kv.match(/program=([^\s]+)/);
+        const hoM = kv.match(/host=([^\s]+)/);
+        const ciM = kv.match(/ip=([^\s]+)/);
+
+        const station = stM ? stM.at(1) : '';
+        const program = prM ? prM.at(1) : '';
+        const host = hoM ? hoM.at(1) : '';
+        const clientIp = ciM ? ciM.at(1) : '';
+
+        if (station && !/DAX|CAT/i.test(program)) {
+          radioStates.set(ip, {
+            status: 'In_Use',
+            inuse_ip: clientIp,
+            inuse_host: host,
+            available_clients: '1',
+            gui_client_handles: handle,
+            gui_client_stations: station,
+            gui_client_programs: program,
+            gui_client_hosts: host,
+            gui_client_ips: clientIp
+          });
+        }
+      }
+
+      const mDisc = line.match(/^S[0-9A-Fa-f]+\|client\s+0x([0-9A-Fa-f]+)\s+disconnected/);
+      const current = radioStates.get(ip);
+      if (mDisc && current && current.gui_client_handles === ('0x' + mDisc.at(1))) {
+        radioStates.set(ip, getDefaultRadioState());
+      }
+    }
+  });
+
+  client.on('error', () => {
+    try { client.destroy(); } catch {}
+    radioSockets.delete(ip);
+  });
+
+  client.on('close', () => {
+    radioSockets.delete(ip);
+  });
+}
 
 // Configuration
 let config = {
-  broadcastIntervalMs: 3000,
+  broadcastIntervalMs: 1000,
   radios: []
 };
 
@@ -74,6 +164,9 @@ function saveConfig() {
 
 // Build VITA-49 Discovery Packet (ported from C# SmartUnlinkService)
 function buildVita49DiscoveryPacket(radio) {
+  ensureFlexTracker(radio.ipAddress);
+  const state = radioStates.get(radio.ipAddress) || getDefaultRadioState();
+
   // Build payload string (key=value pairs separated by space)
   const payloadStr = [
     `discovery_protocol_version=3.1.0.2`,
@@ -84,19 +177,24 @@ function buildVita49DiscoveryPacket(radio) {
     `callsign=${radio.callsign || ''}`,
     `ip=${radio.ipAddress}`,
     `port=4992`,
-    `status=Available`,
-    `inuse_ip=`,
-    `inuse_host=`,
+    `status=${state.status}`,
+    `inuse_ip=${state.inuse_ip}`,
+    `inuse_host=${state.inuse_host}`,
     `max_licensed_version=v3`,
     `radio_license_id=00-00-00-00-00-00`,
     `fpc_mac=`,
     `wan_connected=0`,
     `licensed_clients=4`,
-    `available_clients=4`,
+    `available_clients=${state.available_clients}`,
     `max_panadapters=4`,
     `available_panadapters=4`,
     `max_slices=4`,
-    `available_slices=4`
+    `available_slices=4`,
+    `gui_client_handles=${state.gui_client_handles}`,
+    `gui_client_stations=${state.gui_client_stations}`,
+    `gui_client_programs=${state.gui_client_programs}`,
+    `gui_client_hosts=${state.gui_client_hosts}`,
+    `gui_client_ips=${state.gui_client_ips}`
   ].join(' ');
 
   const payloadBytes = Buffer.from(payloadStr, 'ascii');
@@ -216,7 +314,7 @@ function startBroadcasting() {
           interfaceCount: broadcastAddresses.length
         });
       }
-    }, config.broadcastIntervalMs || 3000);
+    }, config.broadcastIntervalMs || 1000);
 
     console.log(`Broadcasting started (interval: ${config.broadcastIntervalMs}ms)`);
   });
@@ -232,6 +330,11 @@ function stopBroadcasting() {
     udpClient.close();
     udpClient = null;
   }
+  for (const s of radioSockets.values()) {
+    try { s.destroy(); } catch {}
+  }
+  radioSockets.clear();
+  radioStates.clear();
   console.log('Broadcasting stopped');
 }
 
